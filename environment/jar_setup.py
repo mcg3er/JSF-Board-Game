@@ -1,0 +1,43 @@
+"""Download TAG.jar from a TAG GitHub release into pytag/jars/."""
+import argparse
+import os
+import urllib.request
+
+REPO = "GAIGResearch/TabletopGames"
+DEST = "pytag/jars/TAG.jar"
+
+
+def _progress(count, block_size, total):
+    pct = min(count * block_size * 100 // total, 100)
+    bar = "#" * (pct // 2)
+    print(f"\r  [{bar:<50}] {pct:3d}%", end="", flush=True)
+
+
+def download(tag: str, dest: str):
+    path = "latest/download" if tag == "latest" else f"download/{tag}"
+    url = f"https://github.com/{REPO}/releases/{path}/TAG-pytag.jar"
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    print(f"Downloading TAG.jar from {url}")
+    try:
+        urllib.request.urlretrieve(url, dest, reporthook=_progress)
+        print()  # newline after progress bar
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"Download failed ({e.code}): {url}") from e
+    size_mb = os.path.getsize(dest) / 1e6
+    print(f"Saved {dest} ({size_mb:.0f} MB)")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--tag",
+        default="latest",
+        help="TAG release tag to download from (default: latest)",
+    )
+    parser.add_argument(
+        "--dest",
+        default=DEST,
+        help=f"Destination path for TAG.jar (default: {DEST})",
+    )
+    args = parser.parse_args()
+    download(args.tag, args.dest)

@@ -1,0 +1,740 @@
+diff --git a/src/main/java/core/PyTAG.java b/src/main/java/core/PyTAG.java
+index a16d37ed2..b6cf8a115 100644
+--- a/src/main/java/core/PyTAG.java
++++ b/src/main/java/core/PyTAG.java
+@@ -12,11 +12,14 @@ import games.loveletter.features.LLStateFeaturesReduced;
+ import games.powergrid.PowerGridFeatures;
+ import games.powergrid.PowerGridGameState;
+ import games.powergrid.PowerGridParameters;
++import games.pandemic.PandemicFeatures;
++import games.pandemic.PandemicActionSpace;
+ import games.powergrid.components.PowerGridCard;
+ import games.stratego.StrategoFeatures;
+ import games.sushigo.SGFeatures;
+ import games.tictactoe.TTTFeatures;
+ import org.json.simple.JSONObject;
++import org.json.simple.JSONArray;
+ import players.human.HumanGUIPlayer;
+ import players.python.PythonAgent;
+ import players.simple.RandomPlayer;
+@@ -40,7 +43,8 @@ enum FeatureExtractors {
+     SushiGo(null, SGFeatures.class),
+     TicTacToe(TTTFeatures.class, TTTFeatures.class),
+     Diamant(DiamantFeatures.class, DiamantFeatures.class),
+-	PowerGrid(PowerGridFeatures.class, null); //gets both the JSON and Vector observation 
++    PowerGrid(PowerGridFeatures.class, null),
++    Pandemic(null, PandemicFeatures.class);
+     Class<? extends IStateFeatureVector> stateFeatureVector;
+     Class<? extends IStateFeatureJSON> stateFeatureJSON;
+     FeatureExtractors(Class<? extends IStateFeatureVector> stateFeatureVector, Class<? extends IStateFeatureJSON> stateFeatureJSON) {
+@@ -89,6 +93,8 @@ public class PyTAG {
+     private int tick;
+     private int lastPlayer; // used to track actions per 'turn'
+     private List<AbstractAction> availableActions;
++    private PandemicActionSpace pandemicActions;
++    private final List<String> pandemicActionTrace = new ArrayList<>();
+ 
+     boolean isNormalized; // Bool for whether you want observations to be normalized
+ 
+@@ -127,6 +133,7 @@ public class PyTAG {
+         this.players = players;
+         this.stateVectoriser = FeatureExtractors.valueOf(gameToPlay.name()).getStateFeatureVector();
+         this.stateJSONiser = FeatureExtractors.valueOf(gameToPlay.name()).getStateFeatureJSON();
++        if (gameToPlay == GameType.Pandemic) this.pandemicActions = new PandemicActionSpace();
+ 
+         // Creating game instance (null if not implemented)
+         if (parameterConfigFile != null) {
+@@ -185,6 +192,7 @@ public class PyTAG {
+ 
+     // Gets the action space size as an integer
+     public int getActionSpace(){
++        if (pandemicActions != null) return pandemicActions.size();
+         return leaves.size();
+     }
+ 
+@@ -196,11 +204,27 @@ public class PyTAG {
+ 
+     // Gets the action mask as a boolean array
+     public int[] getActionMask() {
++        if (pandemicActions != null) return pandemicActions.mask();
+         return leaves.stream()
+                 .mapToInt(ActionTreeNode::getValue)
+                 .toArray();
+     }
+ 
++    public String getActionLabel(int actionID) {
++        if (pandemicActions == null) throw new UnsupportedOperationException("Action labels are available for Pandemic only");
++        return pandemicActions.label(actionID);
++    }
++
++    public String getLegalActionsJson() {
++        if (pandemicActions == null) throw new UnsupportedOperationException("Legal action descriptors are available for Pandemic only");
++        return pandemicActions.legalActionsJson();
++    }
++
++    public String getPandemicActionTraceJson() {
++        if (pandemicActions == null) throw new UnsupportedOperationException("Action traces are available for Pandemic only");
++        return JSONArray.toJSONString(pandemicActionTrace);
++    }
++
+     // gets the whole action tree as an array (tree can be reconstructed using the getTreeShape() function)
+     public int[] getActionTree() {
+         return root.getActionMask();
+@@ -213,6 +237,13 @@ public class PyTAG {
+ 
+     // Plays an action given an actionID
+     public void executeAction(int actionID) throws Exception {
++        if (pandemicActions != null) {
++            AbstractAction action = pandemicActions.action(actionID);
++            if (action == null) throw new IllegalArgumentException("Illegal Pandemic action ID: " + actionID);
++            pandemicActionTrace.add(PandemicActionSpace.key(action, observationForActions()));
++            forwardModel.next(gameState, action);
++            return;
++        }
+         if (forwardModel instanceof ITreeActionSpace) {
+             ActionTreeNode node = leaves.get(actionID);
+             AbstractAction action = node.getAction();
+@@ -225,13 +256,20 @@ public class PyTAG {
+ 
+     public void reset(){
+         // Reset game instance, run built-in agents until a python agent is required to make a decision
+-        this.game.reset(players);
++        this.lastSeed = seedRandom.nextLong();
++        pandemicActionTrace.clear();
++        if (pandemicActions != null) {
++            for (int i = 0; i < players.size(); i++) {
++                if (players.get(i) instanceof RandomPlayer) {
++                    players.get(i).getRnd().setSeed(new Random(lastSeed ^ (0x9E3779B97F4A7C15L * (i + 1))).nextLong());
++                }
++            }
++        }
++        this.game.reset(players, this.lastSeed);
+         this.turnPause = 0;
+         this.tick = 0;
+         this.game.setTurnPause(turnPause);
+         this.gameState = game.getGameState();
+-        this.lastSeed = seedRandom.nextLong();
+-        gameState.gameParameters.setRandomSeed(this.lastSeed);
+         this.forwardModel = game.getForwardModel();
+         this.availableActions = forwardModel.computeAvailableActions(gameState);
+ 
+@@ -241,6 +279,15 @@ public class PyTAG {
+         
+ 
+         // get action tree for current player
++        if (pandemicActions != null) {
++            if (!isTerminal) {
++                AbstractGameState observation = observationForActions();
++                this.availableActions = forwardModel.computeAvailableActions(observation);
++                pandemicActions.update(availableActions, observation);
++            }
++            else pandemicActions.clear();
++            return;
++        }
+         if (this.root == null){
+             this.root = ((ITreeActionSpace)this.forwardModel).initActionTree(this.gameState);
+         }
+@@ -252,6 +299,10 @@ public class PyTAG {
+         this.leaves = root.getLeafNodes();
+     }
+ 
++    private AbstractGameState observationForActions() {
++        return gameState.copy(gameState.getCurrentPlayer());
++    }
++
+ 
+    
+ 
+@@ -314,6 +365,7 @@ public class PyTAG {
+                 throw new AssertionError("We have a NULL action in the Game loop");
+ 
+             // Check player timeout
++            if (pandemicActions != null) pandemicActionTrace.add(PandemicActionSpace.key(action, observation));
+             forwardModel.next(gameState, action);
+             tick++;
+ 
+@@ -337,6 +389,7 @@ public class PyTAG {
+         if (isDone()){
+             // check if the game has just ended
+             // game is over
++            if (pandemicActions != null) pandemicActions.clear();
+             return gameState.copy(gameState.getCurrentPlayer());
+         }
+ 
+@@ -344,6 +397,7 @@ public class PyTAG {
+         boolean isTerminal = nextDecision();
+         if (isTerminal){
+             // game is over
++            if (pandemicActions != null) pandemicActions.clear();
+             return gameState.copy(gameState.getCurrentPlayer());
+         }
+ 
+@@ -352,6 +406,10 @@ public class PyTAG {
+ 
+         // Compute the updated available actions and the action tree
+         this.availableActions = forwardModel.computeAvailableActions(observation);
++        if (pandemicActions != null) {
++            pandemicActions.update(availableActions, observation);
++            return observation;
++        }
+         this.root = ((ITreeActionSpace)this.forwardModel).updateActionTree(this.root, this.gameState);
+         this.leaves = root.getLeafNodes();
+ 
+@@ -366,6 +424,10 @@ public class PyTAG {
+         return this.lastSeed;
+     }
+ 
++    public void setSeed(long seed) {
++        this.seedRandom = new Random(seed);
++    }
++
+     public CoreConstants.GameResult[] getPlayerResults(){
+         return this.gameState.getPlayerResults();
+     }
+diff --git a/src/main/java/games/pandemic/PandemicActionFactory.java b/src/main/java/games/pandemic/PandemicActionFactory.java
+index 7ea2dc02c..45934cd0f 100644
+--- a/src/main/java/games/pandemic/PandemicActionFactory.java
++++ b/src/main/java/games/pandemic/PandemicActionFactory.java
+@@ -37,7 +37,7 @@ class PandemicActionFactory {
+         int activePlayer = pgs.getTurnOrder().getCurrentPlayer(pgs);
+ 
+         // Create a list for possible actions, including first move actions
+-        Set<AbstractAction> actions = new HashSet<>(getMoveActions(pgs, activePlayer, playerHand));
++        Set<AbstractAction> actions = new HashSet<>(getMoveActions(pgs, activePlayer, activePlayer, playerHand));
+ 
+         // Build research station, discard card corresponding to current player location to build one, if not already there.
+         if (!((PropertyBoolean) playerLocationNode.getProperty(researchStationHash)).value
+@@ -191,7 +191,7 @@ class PandemicActionFactory {
+                 // Move another player’s pawn, if its owner agrees, as if it were his own.
+                 for (int i = 0; i < pgs.getNPlayers(); i++) {
+                     if (i != playerIdx) {
+-                        actions.addAll(getMoveActions(pgs, i, playerHand));
++                        actions.addAll(getMoveActions(pgs, i, playerIdx, playerHand));
+                     }
+                 }
+                 break;
+@@ -250,7 +250,7 @@ class PandemicActionFactory {
+      * @param playerHand - deck of cards to be used for movement
+      * @return all movement actions
+      */
+-    static List<AbstractAction> getMoveActions(PandemicGameState pgs, int playerId, Deck<Card> playerHand){
++    static List<AbstractAction> getMoveActions(PandemicGameState pgs, int playerId, int cardOwner, Deck<Card> playerHand){
+         Set<AbstractAction> actions = new HashSet<>();
+ 
+         PropertyString playerLocationProperty = (PropertyString) pgs.getComponent(playerCardHash, playerId)
+@@ -279,11 +279,11 @@ class PandemicActionFactory {
+                             // Charter flight, discard card that matches your city and travel to any city
+                             // Only add the ones that are different from the current location
+                             if (!destination.equals(playerLocationName)) {
+-                                actions.add(new MovePlayerWithCard(MovePlayer.MoveType.CharterFlight, playerId, destination, c, playerId));
++                                actions.add(new MovePlayerWithCard(MovePlayer.MoveType.CharterFlight, playerId, destination, c, cardOwner));
+                             }
+                         } else if (destination.equals(cardCity)) {
+                             // Direct Flight, discard city card and travel to that city
+-                            actions.add(new MovePlayerWithCard(MovePlayer.MoveType.DirectFlight, playerId, cardCity, c, playerId));
++                            actions.add(new MovePlayerWithCard(MovePlayer.MoveType.DirectFlight, playerId, cardCity, c, cardOwner));
+                         }
+                     }
+                 }
+@@ -386,7 +386,7 @@ class PandemicActionFactory {
+                         // Check if player is already there
+                         String pLocation = ((PropertyString) pgs.getComponent(playerCardHash, i).getProperty(playerLocationHash)).value;
+                         if (pLocation.equals(cityName)) continue;
+-                        actions.add(new MovePlayerWithCard(MovePlayer.MoveType.Airlift, i, cityName, cardIdx, playerIdx));
++                        actions.add(new MovePlayerWithCard(MovePlayer.MoveType.Airlift, i, cityName, cardIdx, playerIdx, deckFrom));
+                     }
+                 }
+ 
+diff --git a/src/main/java/games/pandemic/PandemicActionSpace.java b/src/main/java/games/pandemic/PandemicActionSpace.java
+new file mode 100644
+index 000000000..485c69481
+--- /dev/null
++++ b/src/main/java/games/pandemic/PandemicActionSpace.java
+@@ -0,0 +1,244 @@
++package games.pandemic;
++
++import core.AbstractGameState;
++import core.actions.AbstractAction;
++import core.actions.DrawCard;
++import core.actions.RearrangeDeckOfCards;
++import core.actions.RemoveComponentFromDeck;
++import core.components.Card;
++import core.components.Deck;
++import core.properties.PropertyString;
++import games.pandemic.actions.AddResearchStation;
++import games.pandemic.actions.AddResearchStationFrom;
++import games.pandemic.actions.AddResearchStationWithCard;
++import games.pandemic.actions.AddResearchStationWithCardFrom;
++import games.pandemic.actions.CureDisease;
++import games.pandemic.actions.MovePlayer;
++import games.pandemic.actions.MovePlayerWithCard;
++import games.pandemic.actions.ShareKnowledge;
++import games.pandemic.actions.TreatDisease;
++import org.json.simple.JSONArray;
++import org.json.simple.JSONObject;
++import static core.CoreConstants.nameHash;
++import static core.CoreConstants.playerHandHash;
++
++import java.nio.charset.StandardCharsets;
++import java.util.*;
++
++/** Fixed, sparse action IDs. TAG supplies every legal action; this class only indexes them. */
++public final class PandemicActionSpace {
++    public static final int SIZE = 131072;
++    private final AbstractAction[] actions = new AbstractAction[SIZE];
++    private final int[] mask = new int[SIZE];
++    private final String[] labels = new String[SIZE];
++    private final String[] assigned = new String[SIZE];
++    private final Map<String, Integer> keyToId = new HashMap<>();
++    private final JSONArray legalActions = new JSONArray();
++
++    public int size() { return SIZE; }
++    public int[] mask() { return mask.clone(); }
++    public AbstractAction action(int id) {
++        return id >= 0 && id < SIZE ? actions[id] : null;
++    }
++    public String label(int id) {
++        return id >= 0 && id < SIZE ? labels[id] : null;
++    }
++    public String legalActionsJson() { return legalActions.toJSONString(); }
++    public void clear() {
++        Arrays.fill(actions, null);
++        Arrays.fill(mask, 0);
++        Arrays.fill(labels, null);
++        legalActions.clear();
++    }
++
++    public void update(List<AbstractAction> legal, AbstractGameState observation) {
++        clear();
++        TreeMap<String, AbstractAction> keyed = new TreeMap<>();
++        for (AbstractAction action : legal) {
++            String key = key(action, observation);
++            if (keyed.put(key, action) != null)
++                throw new IllegalStateException("Pandemic action key collision: " + key);
++        }
++        for (Map.Entry<String, AbstractAction> entry : keyed.entrySet()) {
++            String key = entry.getKey();
++            Integer known = keyToId.get(key);
++            int id = known == null ? hash(key) & (SIZE - 1) : known;
++            if (known == null) {
++                while (assigned[id] != null) id = (id + 1) & (SIZE - 1);
++                assigned[id] = key;
++                keyToId.put(key, id);
++            }
++            mask[id] = 1;
++            actions[id] = entry.getValue();
++            JSONObject descriptor = describe(key, id, entry.getValue(), observation);
++            labels[id] = (String) descriptor.get("label");
++            legalActions.add(descriptor);
++        }
++    }
++
++    private static int hash(String key) {
++        // FNV-1a over UTF-8; deterministic across Java processes and platforms.
++        int h = 0x811c9dc5;
++        for (byte b : key.getBytes(StandardCharsets.UTF_8)) {
++            h ^= b & 0xff;
++            h *= 0x01000193;
++        }
++        return h;
++    }
++
++    public static String key(AbstractAction action, AbstractGameState state) {
++        String prefix = "p" + state.getCurrentPlayer() + ":" + action.getClass().getSimpleName() + ":";
++        if (action instanceof RearrangeDeckOfCards) {
++            return prefix + Arrays.toString(((RearrangeDeckOfCards) action).getNewCardOrder());
++        }
++        if (action instanceof CureDisease) {
++            CureDisease cure = (CureDisease) action;
++            List<String> cards = new ArrayList<>();
++            for (Integer id : cure.getCards())
++                cards.add(cardNameById(state, id));
++            Collections.sort(cards);
++            return prefix + cure.getColor() + ":" + cards;
++        }
++        if (action instanceof AddResearchStationWithCardFrom) {
++            AddResearchStationWithCardFrom station = (AddResearchStationWithCardFrom) action;
++            return prefix + station.getCity() + ":" + station.getFromCity() + ":"
++                    + state.getComponentById(station.getSourceDeckId()).getComponentName() + ":"
++                    + cardName(station.getCard(state));
++        }
++        if (action instanceof AddResearchStationWithCard) {
++            AddResearchStationWithCard station = (AddResearchStationWithCard) action;
++            return prefix + station.getCity() + ":"
++                    + state.getComponentById(station.getSourceDeckId()).getComponentName() + ":"
++                    + cardName(station.getCard(state));
++        }
++        if (action instanceof MovePlayerWithCard) {
++            MovePlayerWithCard move = (MovePlayerWithCard) action;
++            Card card = move.getCard(state);
++            String source = move.cardDeckFrom < 0 ? "hand of p" + move.playerDiscarding
++                    : state.getComponentById(move.cardDeckFrom).getComponentName();
++            return prefix + move.toString()
++                    .replace("card " + move.cardIdx, "card " + cardName(card))
++                    .replace(" from " + move.cardDeckFrom, " from " + source);
++        }
++        if (action instanceof ShareKnowledge) return prefix + action.getString(state);
++        if (action instanceof RemoveComponentFromDeck) {
++            RemoveComponentFromDeck<?> remove = (RemoveComponentFromDeck<?>) action;
++            Deck<?> deck = (Deck<?>) state.getComponentById(remove.getDeck());
++            return prefix + (deck == null ? remove.getDeck() + ":" + remove.getComponentIdx()
++                    : cardName((Card) deck.get(remove.getComponentIdx())));
++        }
++        if (action instanceof DrawCard) {
++            DrawCard draw = (DrawCard) action;
++            Card card = draw.getCard(state);
++            return prefix + (state.getComponentById(draw.getDeckFrom()) == null ? draw.getDeckFrom() : state.getComponentById(draw.getDeckFrom()).getComponentName())
++                    + ":" + (state.getComponentById(draw.getDeckTo()) == null ? draw.getDeckTo() : state.getComponentById(draw.getDeckTo()).getComponentName())
++                    + ":" + (card == null ? draw.getFromIndex() : cardName(card))
++                    + ":" + (state.getComponentById(draw.getDeckFrom()) == null ? "" : state.getComponentById(draw.getDeckFrom()).getOwnerId());
++        }
++        return prefix + action.toString();
++    }
++
++    private static String cardName(Card card) {
++        PropertyString property = (PropertyString) card.getProperty(nameHash);
++        return property == null ? card.getComponentName() : property.value;
++    }
++
++    private static String cardNameById(AbstractGameState state, int id) {
++        if (state.getComponentById(id) instanceof Card)
++            return cardName((Card) state.getComponentById(id));
++        PandemicGameState pandemic = (PandemicGameState) state;
++        for (int player = 0; player < state.getNPlayers(); player++) {
++            Deck<Card> hand = (Deck<Card>) pandemic.getComponent(playerHandHash, player);
++            for (Card card : hand.getComponents())
++                if (card.getComponentID() == id) return cardName(card);
++        }
++        throw new IllegalStateException("Cure action refers to a card outside visible hands: " + id);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static JSONObject describe(String key, int maskIndex, AbstractAction action, AbstractGameState state) {
++        JSONObject result = new JSONObject();
++        JSONObject details = new JSONObject();
++        String type = action.getClass().getSimpleName();
++        String label = action.toString();
++        details.put("type", type);
++        if (action instanceof MovePlayer) {
++            MovePlayer move = (MovePlayer) action;
++            details.put("move_type", move.getMoveType().name());
++            details.put("city", move.getDestination());
++            details.put("target_player", move.getPlayerToMove());
++            if (action instanceof MovePlayerWithCard) {
++                MovePlayerWithCard withCard = (MovePlayerWithCard) action;
++                String card = cardName(withCard.getCard(state));
++                details.put("card", card);
++                details.put("card_owner", withCard.playerDiscarding);
++                label = move.getMoveType() + ": move player " + move.getPlayerToMove()
++                        + " to " + move.getDestination() + " using " + card;
++            }
++        } else if (action instanceof TreatDisease) {
++            TreatDisease treat = (TreatDisease) action;
++            details.put("city", treat.getCity());
++            details.put("color", treat.getColor());
++            details.put("treat_all", treat.isTreatAll());
++        } else if (action instanceof CureDisease) {
++            CureDisease cure = (CureDisease) action;
++            details.put("color", cure.getColor());
++            JSONArray cards = new JSONArray();
++            for (Integer cardId : cure.getCards()) cards.add(cardNameById(state, cardId));
++            details.put("cards", cards);
++            label = "Cure " + cure.getColor() + " using " + cards;
++        } else if (action instanceof AddResearchStation) {
++            AddResearchStation station = (AddResearchStation) action;
++            details.put("city", station.getCity());
++            if (action instanceof AddResearchStationFrom)
++                details.put("from_city", ((AddResearchStationFrom) action).getFromCity());
++            Card card = action instanceof AddResearchStationWithCardFrom
++                    ? ((AddResearchStationWithCardFrom) action).getCard(state)
++                    : action instanceof AddResearchStationWithCard
++                    ? ((AddResearchStationWithCard) action).getCard(state) : null;
++            if (card != null) {
++                details.put("card", cardName(card));
++                int sourceId = action instanceof AddResearchStationWithCardFrom
++                        ? ((AddResearchStationWithCardFrom) action).getSourceDeckId()
++                        : ((AddResearchStationWithCard) action).getSourceDeckId();
++                details.put("source", state.getComponentById(sourceId).getComponentName());
++                label += " using " + cardName(card);
++            }
++        } else if (action instanceof ShareKnowledge) {
++            ShareKnowledge share = (ShareKnowledge) action;
++            String card = cardName(share.getCard(state));
++            details.put("card", card);
++            details.put("source_player", share.getGiver());
++            details.put("target_player", share.getReceiver());
++            label = "Share " + card + " from player " + share.getGiver() + " to player " + share.getReceiver();
++        } else if (action instanceof RearrangeDeckOfCards) {
++            JSONArray order = new JSONArray();
++            for (int index : ((RearrangeDeckOfCards) action).getNewCardOrder()) order.add(index);
++            details.put("order", order);
++            label = "Forecast: reorder infection cards " + order;
++        } else if (action instanceof RemoveComponentFromDeck) {
++            RemoveComponentFromDeck<?> remove = (RemoveComponentFromDeck<?>) action;
++            Deck<?> deck = (Deck<?>) state.getComponentById(remove.getDeck());
++            String card = cardName((Card) deck.get(remove.getComponentIdx()));
++            details.put("card", cardName(remove.getCard(state)));
++            details.put("removed_card", card);
++            label = "Resilient Population: remove " + card;
++        } else if (action instanceof DrawCard) {
++            DrawCard draw = (DrawCard) action;
++            Card card = draw.getCard(state);
++            if (card != null) {
++                details.put("card", cardName(card));
++                label = type + ": " + cardName(card);
++            }
++            if (state.getComponentById(draw.getDeckFrom()) != null)
++                details.put("source", state.getComponentById(draw.getDeckFrom()).getComponentName());
++            if (state.getComponentById(draw.getDeckTo()) != null)
++                details.put("destination", state.getComponentById(draw.getDeckTo()).getComponentName());
++        }
++        result.put("id", key);
++        result.put("label", label);
++        result.put("mask_index", maskIndex);
++        result.put("details", details);
++        return result;
++    }
++}
+diff --git a/src/main/java/games/pandemic/PandemicFeatures.java b/src/main/java/games/pandemic/PandemicFeatures.java
+new file mode 100644
+index 000000000..f1604041c
+--- /dev/null
++++ b/src/main/java/games/pandemic/PandemicFeatures.java
+@@ -0,0 +1,94 @@
++package games.pandemic;
++
++import core.AbstractGameState;
++import core.components.*;
++import core.interfaces.IStateFeatureJSON;
++import core.properties.*;
++import org.json.simple.JSONArray;
++import org.json.simple.JSONObject;
++import utilities.Hash;
++
++import java.util.*;
++
++import static core.CoreConstants.*;
++import static games.pandemic.PandemicConstants.*;
++
++/** Public board and hands plus the acting player's Forecast knowledge. Never serializes hidden decks. */
++public class PandemicFeatures implements IStateFeatureJSON {
++    private static String name(Component component) {
++        PropertyString p = (PropertyString) component.getProperty(nameHash);
++        return p == null ? component.getComponentName() : p.value;
++    }
++
++    private static JSONArray cards(Deck<Card> deck) {
++        JSONArray result = new JSONArray();
++        for (Card card : deck.getComponents()) result.add(name(card));
++        return result;
++    }
++
++    @Override
++    @SuppressWarnings("unchecked")
++    public String getObservationJson(AbstractGameState gameState, int playerId) {
++        PandemicGameState state = (PandemicGameState) gameState;
++        JSONObject result = new JSONObject();
++        result.put("player_id", playerId);
++        result.put("n_players", state.getNPlayers());
++        result.put("phase", state.getGamePhase().toString());
++        result.put("turn_step", ((PandemicTurnOrder) state.getTurnOrder()).getTurnStep());
++        result.put("round", state.getRoundCounter());
++        result.put("quiet_night", state.isQuietNight());
++        result.put("epidemic", state.isEpidemic());
++        result.put("cards_drawn", state.getNCardsDrawn());
++
++        JSONArray players = new JSONArray();
++        for (int id = 0; id < state.getNPlayers(); id++) {
++            JSONObject player = new JSONObject();
++            Card role = (Card) state.getComponent(playerCardHash, id);
++            player.put("role", state.getPlayerRole(id));
++            player.put("location", ((PropertyString) role.getProperty(playerLocationHash)).value);
++            player.put("hand", cards((Deck<Card>) state.getComponent(playerHandHash, id)));
++            players.add(player);
++        }
++        result.put("players", players);
++
++        TreeMap<String, JSONObject> cities = new TreeMap<>();
++        for (BoardNode node : state.getWorld().getBoardNodes()) {
++            JSONObject city = new JSONObject();
++            JSONArray cityCubes = new JSONArray();
++            for (int amount : ((PropertyIntArray) node.getProperty(infectionHash)).getValues()) cityCubes.add(amount);
++            city.put("cubes", cityCubes);
++            city.put("research_station", ((PropertyBoolean) node.getProperty(researchStationHash)).value);
++            cities.put(name(node), city);
++        }
++        result.put("cities", cities);
++
++        JSONObject tracks = new JSONObject();
++        tracks.put("infection_rate", ((Counter) state.getComponent(infectionRateHash)).getValue());
++        tracks.put("outbreaks", ((Counter) state.getComponent(outbreaksHash)).getValue());
++        tracks.put("research_stations_available", ((Counter) state.getComponent(researchStationHash)).getValue());
++        JSONObject diseases = new JSONObject();
++        JSONObject cubes = new JSONObject();
++        for (String color : colors) {
++            diseases.put(color, ((Counter) state.getComponent(Hash.GetInstance().hash("Disease " + color))).getValue());
++            cubes.put(color, ((Counter) state.getComponent(Hash.GetInstance().hash("Disease Cube " + color))).getValue());
++        }
++        tracks.put("cures", diseases);
++        tracks.put("cubes_available", cubes);
++        result.put("tracks", tracks);
++
++        Deck<Card> playerDeck = (Deck<Card>) state.getComponent(playerDeckHash);
++        Deck<Card> infectionDeck = (Deck<Card>) state.getComponent(infectionHash);
++        result.put("player_deck_count", playerDeck.getSize());
++        result.put("infection_deck_count", infectionDeck.getSize());
++        result.put("player_discard", cards((Deck<Card>) state.getComponent(playerDeckDiscardHash)));
++        result.put("infection_discard", cards((Deck<Card>) state.getComponent(infectionDiscardHash)));
++        result.put("planner_card", cards((Deck<Card>) state.getComponent(plannerDeckHash)));
++        if (state.getGamePhase() == PandemicGameState.PandemicGamePhase.Forecast) {
++            JSONArray top = new JSONArray();
++            int count = Math.min(infectionDeck.getSize(), ((PandemicParameters) state.getGameParameters()).nForecastCards);
++            for (int i = 0; i < count; i++) top.add(name(infectionDeck.get(i)));
++            result.put("forecast_cards", top);
++        }
++        return result.toJSONString();
++    }
++}
+diff --git a/src/main/java/games/pandemic/PandemicForwardModel.java b/src/main/java/games/pandemic/PandemicForwardModel.java
+index 8936f28b8..8587162f3 100644
+--- a/src/main/java/games/pandemic/PandemicForwardModel.java
++++ b/src/main/java/games/pandemic/PandemicForwardModel.java
+@@ -371,6 +371,13 @@ public class PandemicForwardModel extends AbstractRuleBasedForwardModel {
+         pgs.getTurnOrder().endPlayerTurn(state);
+     }
+ 
++    @Override
++    protected void _next(AbstractGameState state, AbstractAction action) {
++        super._next(state, action);
++        if (!state.isNotTerminal() && state.getPlayerResults()[0] == CoreConstants.GameResult.GAME_ONGOING)
++            endGame(state);
++    }
++
+     @Override
+     protected void endGame(AbstractGameState gameState) {
+         for (int i = 0; i < gameState.getNPlayers(); i++) {
+diff --git a/src/main/java/games/pandemic/actions/AddResearchStationWithCard.java b/src/main/java/games/pandemic/actions/AddResearchStationWithCard.java
+index 25e584fc2..da4a263f2 100644
+--- a/src/main/java/games/pandemic/actions/AddResearchStationWithCard.java
++++ b/src/main/java/games/pandemic/actions/AddResearchStationWithCard.java
+@@ -42,6 +42,8 @@ public class AddResearchStationWithCard extends AddResearchStation {
+         return (Card) gs.getComponentById(cardId);
+     }
+ 
++    public int getSourceDeckId() { return deckFrom; }
++
+     @Override
+     public boolean equals(Object o) {
+         if (this == o) return true;
+diff --git a/src/main/java/games/pandemic/actions/AddResearchStationWithCardFrom.java b/src/main/java/games/pandemic/actions/AddResearchStationWithCardFrom.java
+index 9dd9572f1..7b3757907 100644
+--- a/src/main/java/games/pandemic/actions/AddResearchStationWithCardFrom.java
++++ b/src/main/java/games/pandemic/actions/AddResearchStationWithCardFrom.java
+@@ -44,6 +44,8 @@ public class AddResearchStationWithCardFrom extends AddResearchStationFrom {
+         return (Card) gs.getComponentById(cardId);
+     }
+ 
++    public int getSourceDeckId() { return deckFrom; }
++
+     @Override
+     public boolean equals(Object o) {
+         if (this == o) return true;
+diff --git a/src/main/java/games/pandemic/actions/MovePlayer.java b/src/main/java/games/pandemic/actions/MovePlayer.java
+index ada35e060..f8729b0dd 100644
+--- a/src/main/java/games/pandemic/actions/MovePlayer.java
++++ b/src/main/java/games/pandemic/actions/MovePlayer.java
+@@ -94,6 +94,10 @@ public class MovePlayer extends AbstractAction {
+         return playerToMove;
+     }
+ 
++    public MoveType getMoveType() {
++        return moveType;
++    }
++
+     @Override
+     public int hashCode() {
+         return Objects.hash(playerToMove, destination);
+diff --git a/src/main/java/games/pandemic/actions/MovePlayerWithCard.java b/src/main/java/games/pandemic/actions/MovePlayerWithCard.java
+index b9a77059d..bb9df01fd 100644
+--- a/src/main/java/games/pandemic/actions/MovePlayerWithCard.java
++++ b/src/main/java/games/pandemic/actions/MovePlayerWithCard.java
+@@ -16,19 +16,29 @@ import static core.CoreConstants.playerHandHash;
+ @SuppressWarnings("unchecked")
+ public class MovePlayerWithCard extends MovePlayer {
+ 
+-    public final int cardIdx, playerDiscarding;
++    public final int cardIdx, playerDiscarding, cardDeckFrom;
+     private int cardId;
+     private boolean executed;
+ 
+     public MovePlayerWithCard(MoveType type, int playerToMove, String city, int cardIdx, int playerDiscarding) {
++        this(type, playerToMove, city, cardIdx, playerDiscarding, -1);
++    }
++
++    public MovePlayerWithCard(MoveType type, int playerToMove, String city, int cardIdx, int playerDiscarding, int cardDeckFrom) {
+         super(type, playerToMove, city);
+         this.cardIdx = cardIdx;
+         this.playerDiscarding = playerDiscarding;
++        this.cardDeckFrom = cardDeckFrom;
++    }
++
++    private Deck<Card> sourceDeck(AbstractGameState gs) {
++        if (cardDeckFrom >= 0) return (Deck<Card>) gs.getComponentById(cardDeckFrom);
++        return (Deck<Card>) ((PandemicGameState) gs).getComponent(playerHandHash, playerDiscarding);
+     }
+ 
+     @Override
+     public boolean execute(AbstractGameState gs) {
+-        Deck<Card> playerHand = (Deck<Card>) ((PandemicGameState)gs).getComponent(playerHandHash, playerDiscarding);
++        Deck<Card> playerHand = sourceDeck(gs);
+         Deck<Card> discardPile = (Deck<Card>) ((PandemicGameState)gs).getComponent(playerDeckDiscardHash);
+         DrawCard cardDiscardAction = new DrawCard(playerHand.getComponentID(), discardPile.getComponentID(), cardIdx);
+         if (super.execute(gs) && cardDiscardAction.execute(gs)) {
+@@ -41,7 +51,7 @@ public class MovePlayerWithCard extends MovePlayer {
+ 
+     public Card getCard(AbstractGameState gs) {
+         if (!executed) {
+-            Deck<Card> deck = (Deck<Card>) ((PandemicGameState)gs).getComponent(playerHandHash, playerDiscarding);
++            Deck<Card> deck = sourceDeck(gs);
+             return deck.getComponents().get(cardIdx);
+         }
+         return (Card) gs.getComponentById(cardId);
+@@ -53,21 +63,21 @@ public class MovePlayerWithCard extends MovePlayer {
+         if (!(o instanceof MovePlayerWithCard)) return false;
+         if (!super.equals(o)) return false;
+         MovePlayerWithCard that = (MovePlayerWithCard) o;
+-        return cardIdx == that.cardIdx;
++        return cardIdx == that.cardIdx && playerDiscarding == that.playerDiscarding && cardDeckFrom == that.cardDeckFrom;
+     }
+ 
+     @Override
+     public int hashCode() {
+-        return Objects.hash(super.hashCode(), cardIdx);
++        return Objects.hash(super.hashCode(), cardIdx, playerDiscarding, cardDeckFrom);
+     }
+ 
+     @Override
+     public String toString() {
+-        return moveType.name() + ": p" + playerToMove + " to " + destination + " with card " + cardIdx + " of p" + playerDiscarding;
++        return moveType.name() + ": p" + playerToMove + " to " + destination + " with card " + cardIdx + " of p" + playerDiscarding + " from " + cardDeckFrom;
+     }
+ 
+     @Override
+     public AbstractAction copy() {
+-        return new MovePlayerWithCard(moveType, playerToMove, destination, cardIdx, playerDiscarding);
++        return new MovePlayerWithCard(moveType, playerToMove, destination, cardIdx, playerDiscarding, cardDeckFrom);
+     }
+ }
+diff --git a/src/main/java/games/pandemic/actions/TreatDisease.java b/src/main/java/games/pandemic/actions/TreatDisease.java
+index c48028c4f..a120fced7 100644
+--- a/src/main/java/games/pandemic/actions/TreatDisease.java
++++ b/src/main/java/games/pandemic/actions/TreatDisease.java
+@@ -100,4 +100,8 @@ public class TreatDisease extends AbstractAction {
+     public String getString(AbstractGameState gameState) {
+         return toString();
+     }
++
++    public String getColor() { return color; }
++    public String getCity() { return city; }
++    public boolean isTreatAll() { return treatAll; }
+ }
